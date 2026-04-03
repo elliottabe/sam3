@@ -1008,6 +1008,133 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         inference_state["frames_already_tracked"].clear()
         inference_state["first_ann_frame_idx"] = None
 
+    # ── Streaming API ────────────────────────────────────────────────
+    # The following methods support frame-at-a-time tracking without
+    # pre-loading the entire video into inference_state["images"].
+
+    @torch.inference_mode()
+    def _inject_frame_features(self, inference_state, frame_idx, frame_tensor):
+        """Pre-compute backbone features for a raw frame and cache them.
+
+        Args:
+            inference_state: current tracking state
+            frame_idx: index to assign to this frame
+            frame_tensor: (3, H, W) float tensor, resized to model image_size
+                          and normalised (mean=0.5, std=0.5)
+        """
+        # Only recompute if not already cached for this frame_idx
+        cached_fi, _ = next(iter(inference_state["cached_features"].items()), (None, None))
+        if cached_fi == frame_idx:
+            return
+        image = frame_tensor.cuda().float().unsqueeze(0)  # (1, 3, H, W)
+        backbone_out = self.forward_image(image)
+        inference_state["cached_features"] = {frame_idx: (image, backbone_out)}
+
+    @torch.inference_mode()
+    def add_new_mask_with_frame(
+        self, inference_state, frame_idx, obj_id, mask, frame_tensor
+    ):
+        """Add an initial mask for one object, injecting the frame on-the-fly.
+
+        Call once per object on the init frame (same frame_idx is fine for
+        multiple objects — cached features are reused).
+
+        Args:
+            inference_state: current tracking state
+            frame_idx: frame index for the init frame
+            obj_id: unique integer id for this object
+            mask: (H, W) binary/float tensor (object=True/1)
+            frame_tensor: (3, H, W) normalised float tensor (see _inject_frame_features)
+
+        Returns:
+            Same as add_new_mask.
+        """
+        self._inject_frame_features(inference_state, frame_idx, frame_tensor)
+        return self.add_new_mask(inference_state, frame_idx, obj_id, mask)
+
+    @torch.inference_mode()
+    def track_single_frame(
+        self, inference_state, frame_idx, frame_tensor, trim_memory=False
+    ):
+        """Track all registered objects on a single new frame (streaming mode).
+
+        This is the frame-at-a-time equivalent of one iteration inside
+        ``propagate_in_video``.
+
+        Args:
+            inference_state: current tracking state (must have been prepared
+                via ``propagate_in_video_preflight`` after adding masks).
+            frame_idx: sequential frame index (must increase monotonically).
+            frame_tensor: (3, H, W) normalised float tensor for this frame.
+            trim_memory: if True, evict old non-conditioning memory to keep
+                GPU usage bounded for long sequences.
+
+        Returns:
+            (frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores)
+            Same tuple format yielded by ``propagate_in_video``.
+        """
+        self._inject_frame_features(inference_state, frame_idx, frame_tensor)
+
+        output_dict = inference_state["output_dict"]
+        batch_size = self._get_obj_num(inference_state)
+        storage_key = "non_cond_frame_outputs"
+
+        current_out, pred_masks = self._run_single_frame_inference(
+            inference_state=inference_state,
+            output_dict=output_dict,
+            frame_idx=frame_idx,
+            batch_size=batch_size,
+            is_init_cond_frame=False,
+            point_inputs=None,
+            mask_inputs=None,
+            reverse=False,
+            run_mem_encoder=True,
+        )
+        obj_scores = current_out["object_score_logits"]
+        output_dict[storage_key][frame_idx] = current_out
+        self._add_output_per_object(
+            inference_state, frame_idx, current_out, storage_key
+        )
+        inference_state["frames_already_tracked"][frame_idx] = {"reverse": False}
+
+        low_res_masks, video_res_masks = self._get_orig_video_res_output(
+            inference_state, pred_masks
+        )
+
+        if trim_memory:
+            self._trim_streaming_memory(inference_state, frame_idx)
+
+        obj_ids = inference_state["obj_ids"]
+        return frame_idx, obj_ids, low_res_masks, video_res_masks, obj_scores
+
+    def _trim_streaming_memory(self, inference_state, current_frame_idx):
+        """Evict old non-conditioning frame outputs to bound memory usage.
+
+        Keeps conditioning frames (init annotations) and the most recent
+        ``max_keep`` non-conditioning frames.  Everything older is deleted
+        from both the shared ``output_dict`` and per-object dicts.
+        """
+        num_maskmem = getattr(self, "num_maskmem", 7)
+        max_keep = max(num_maskmem * 3, 30)
+        cutoff = current_frame_idx - max_keep
+        if cutoff <= 0:
+            return
+
+        # Trim shared output dict
+        non_cond = inference_state["output_dict"]["non_cond_frame_outputs"]
+        to_delete = [fi for fi in non_cond if fi < cutoff]
+        for fi in to_delete:
+            del non_cond[fi]
+
+        # Trim per-object output dicts
+        for obj_output_dict in inference_state["output_dict_per_obj"].values():
+            obj_non_cond = obj_output_dict["non_cond_frame_outputs"]
+            to_delete = [fi for fi in obj_non_cond if fi < cutoff]
+            for fi in to_delete:
+                del obj_non_cond[fi]
+
+    # ── End streaming API ────────────────────────────────────────────
+
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
         """Compute the image features on a given frame."""
         # Look up in the cache
